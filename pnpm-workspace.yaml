@@ -1,0 +1,9 @@
+# pnpm-workspace.yaml
+packages:
+  - "apps/*"
+  - "packages/*"
+
+allowBuilds:
+  bcrypt: true
+  esbuild: true
+  unrs-resolver: true
