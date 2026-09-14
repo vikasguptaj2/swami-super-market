@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { fetchOrderByCode } from "@/lib/api";
+import { fetchOrderByCode, fetchStoreSettings } from "@/lib/api";
 import { formatPrice } from "@/lib/utils";
 import {
   CheckCircle2,
@@ -13,6 +13,7 @@ import {
   ArrowLeft,
   Package,
   Check,
+  Gift,
 } from "lucide-react";
 
 interface OrderStatusPageProps {
@@ -21,7 +22,10 @@ interface OrderStatusPageProps {
 
 export default async function OrderStatusPage({ params }: OrderStatusPageProps) {
   const { orderCode } = await params;
-  const data = await fetchOrderByCode(orderCode);
+  const [data, storeSettings] = await Promise.all([
+    fetchOrderByCode(orderCode),
+    fetchStoreSettings(),
+  ]);
 
   if (!data || !data.order) {
     notFound();
@@ -29,18 +33,23 @@ export default async function OrderStatusPage({ params }: OrderStatusPageProps) 
 
   const { order, items } = data;
 
-  const storePhone =
-    process.env.NEXT_PUBLIC_STORE_WHATSAPP_PHONE ||
-    process.env.STORE_WHATSAPP_PHONE ||
-    "918853070705";
+  const storePhone = storeSettings?.whatsappNumber || "918853070705";
   const formattedItems = items
-    .map(
-      (i) =>
-        `- ${i.productNameSnapshot} (${i.variantUnitSnapshot}) x ${i.quantity} = Rs. ${parseFloat(
+    .map((i) => {
+      if (i.freeQuantity && i.freeQuantity > 0) {
+        return `- ${i.productNameSnapshot} (${i.variantUnitSnapshot}) x ${i.quantity}\n  (${i.paidQuantity} paid + ${i.freeQuantity} FREE)\n  = Rs. ${parseFloat(
           i.lineTotal
-        ).toFixed(2)}`
-    )
+        ).toFixed(2)}`;
+      }
+      return `- ${i.productNameSnapshot} (${i.variantUnitSnapshot}) x ${i.quantity} = Rs. ${parseFloat(
+        i.lineTotal
+      ).toFixed(2)}`;
+    })
     .join("\n");
+
+  const discountNum = order.totalDiscount ? parseFloat(order.totalDiscount) : 0;
+  const discountSection =
+    discountNum > 0 ? `*Offer Savings:* - Rs. ${discountNum.toFixed(2)}\n` : "";
 
   const whatsappMessage = `*NEW ORDER: ${order.orderCode}*
 *Swami Super Market - Usasa, Ballia*
@@ -52,8 +61,8 @@ export default async function OrderStatusPage({ params }: OrderStatusPageProps) 
 *Order Items:*
 ${formattedItems}
 ----------------------------------------
-*Subtotal:* Rs. ${parseFloat(order.subtotal).toFixed(2)}
-*Delivery Charge:* Rs. ${parseFloat(order.deliveryCharge).toFixed(2)}
+*Gross Subtotal:* Rs. ${parseFloat(order.subtotal).toFixed(2)}
+${discountSection}*Delivery Charge:* Rs. ${parseFloat(order.deliveryCharge).toFixed(2)}
 *Total Amount:* Rs. ${parseFloat(order.totalAmount).toFixed(2)}
 *Payment Method:* ${order.paymentMethod}
 ----------------------------------------
@@ -194,12 +203,31 @@ Please confirm my order! (Kripya order confirm karein)`;
                 className="p-4 flex items-center justify-between gap-4 text-xs hover:bg-neutral-50/50"
               >
                 <div>
-                  <p className="font-bold text-neutral-900 text-sm">
-                    {item.productNameSnapshot}
-                  </p>
-                  <p className="text-neutral-500 mt-0.5">
-                    Pack: <span className="font-medium text-neutral-700">{item.variantUnitSnapshot}</span> • {formatPrice(item.unitPriceSnapshot)} × {item.quantity}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <p className="font-bold text-neutral-900 text-sm">
+                      {item.productNameSnapshot}
+                    </p>
+                    {item.freeQuantity && item.freeQuantity > 0 ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-extrabold bg-rose-100 text-rose-800 px-2 py-0.5 rounded-full">
+                        <Gift className="w-3 h-3" />
+                        BUY {item.paidQuantity} GET {item.freeQuantity} FREE
+                      </span>
+                    ) : null}
+                  </div>
+                  {item.freeQuantity && item.freeQuantity > 0 ? (
+                    <div className="mt-1 space-y-0.5">
+                      <p className="text-emerald-800 font-bold text-xs">
+                        {item.paidQuantity} paid + {item.freeQuantity} FREE — Total received: {item.quantity} units
+                      </p>
+                      <p className="text-neutral-500 text-[11px]">
+                        Pack: <span className="font-medium text-neutral-700">{item.variantUnitSnapshot}</span> • Rate: {formatPrice(item.unitPriceSnapshot)}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="text-neutral-500 mt-0.5">
+                      Pack: <span className="font-medium text-neutral-700">{item.variantUnitSnapshot}</span> • {formatPrice(item.unitPriceSnapshot)} × {item.quantity}
+                    </p>
+                  )}
                 </div>
                 <div className="font-black text-sm text-neutral-900 shrink-0">
                   {formatPrice(item.lineTotal)}
@@ -215,9 +243,21 @@ Please confirm my order! (Kripya order confirm karein)`;
             <span>Items Subtotal</span>
             <span className="font-semibold text-neutral-900">{formatPrice(order.subtotal)}</span>
           </div>
+          {order.totalDiscount && parseFloat(order.totalDiscount) > 0 && (
+            <div className="flex justify-between text-emerald-700 font-semibold">
+              <span>Offer Savings</span>
+              <span>-{formatPrice(order.totalDiscount)}</span>
+            </div>
+          )}
           <div className="flex justify-between text-neutral-600">
             <span>Delivery Fee</span>
-            <span className="font-semibold text-emerald-700">FREE</span>
+            <span className="font-semibold text-neutral-900">
+              {parseFloat(order.deliveryCharge) === 0 ? (
+                <span className="text-emerald-700 font-bold">FREE</span>
+              ) : (
+                formatPrice(order.deliveryCharge)
+              )}
+            </span>
           </div>
           <div className="flex justify-between text-sm font-black text-neutral-900 pt-2 border-t border-neutral-200">
             <span>Total Payable</span>

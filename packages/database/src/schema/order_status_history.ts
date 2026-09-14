@@ -7,6 +7,7 @@ import {
   index,
 } from "drizzle-orm/pg-core";
 import { orders, orderStatusEnum } from "./orders.js";
+import { adminUsers } from "./admin_users.js";
 
 export const orderStatusHistory = pgTable(
   "order_status_history",
@@ -17,6 +18,8 @@ export const orderStatusHistory = pgTable(
       .references(() => orders.id, { onDelete: "cascade" }),
     status: orderStatusEnum("status").notNull(),
     note: text("note"),
+    changedByAdminId: integer("changed_by_admin_id")
+      .references(() => adminUsers.id, { onDelete: "set null" }),
     changedAt: timestamp("changed_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

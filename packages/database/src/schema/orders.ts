@@ -4,15 +4,18 @@ import {
   varchar,
   text,
   numeric,
+  integer,
   timestamp,
   pgEnum,
   index,
+  jsonb,
 } from "drizzle-orm/pg-core";
 import {
   ORDER_STATUSES,
   PAYMENT_METHODS,
   PAYMENT_STATUSES,
 } from "@swami/shared";
+import { deliveryZones } from "./delivery_zones.js";
 
 // Enums derived directly from shared constants to prevent any drift
 export const orderStatusEnum = pgEnum("order_status", ORDER_STATUSES);
@@ -27,11 +30,29 @@ export const orders = pgTable(
     customerName: varchar("customer_name", { length: 150 }).notNull(),
     customerPhone: varchar("customer_phone", { length: 20 }).notNull(),
     customerAddress: text("customer_address").notNull(),
-    subtotal: numeric("subtotal", { precision: 10, scale: 2 }).notNull(),
+    deliveryZoneId: integer("delivery_zone_id").references(
+      () => deliveryZones.id,
+      { onDelete: "set null" }
+    ),
+    subtotal: numeric("subtotal", { precision: 10, scale: 2 }).notNull(), // Gross subtotal before discounts
+    totalDiscount: numeric("total_discount", { precision: 10, scale: 2 })
+      .notNull()
+      .default("0.00"),
     deliveryCharge: numeric("delivery_charge", { precision: 10, scale: 2 })
       .notNull()
       .default("0.00"),
     totalAmount: numeric("total_amount", { precision: 10, scale: 2 }).notNull(),
+    appliedPromotionsSummary: jsonb("applied_promotions_summary")
+      .$type<
+        Array<{
+          promotionId: number;
+          name: string;
+          type: string;
+          discountAmount: string;
+        }>
+      >()
+      .notNull()
+      .default([]),
     paymentMethod: paymentMethodEnum("payment_method").notNull(),
     paymentStatus: paymentStatusEnum("payment_status")
       .notNull()
@@ -49,6 +70,7 @@ export const orders = pgTable(
     index("orders_order_code_idx").on(table.orderCode),
     index("orders_customer_phone_idx").on(table.customerPhone),
     index("orders_status_idx").on(table.status),
+    index("orders_delivery_zone_id_idx").on(table.deliveryZoneId),
   ]
 );
 

@@ -4,7 +4,13 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { formatPrice } from "@/lib/utils";
-import { createOrder } from "@/lib/api";
+import {
+  createOrder,
+  fetchDeliveryZones,
+  fetchPublicPromotions,
+  DeliveryZone,
+  Promotion,
+} from "@/lib/api";
 import { useCartStore } from "@/lib/store/cart.store";
 import {
   ShoppingBag,
@@ -20,6 +26,10 @@ import {
   User,
   MapPin,
   CreditCard,
+  ChevronDown,
+  Tag,
+  Percent,
+  Gift,
 } from "lucide-react";
 
 export default function CartPage() {
@@ -41,8 +51,22 @@ export default function CartPage() {
   const [customerAddress, setCustomerAddress] = useState("");
   const [paymentMethod, setPaymentMethod] = useState<"COD" | "UPI" | "ONLINE">("COD");
 
+  // Delivery Zones & Promotions State
+  const [deliveryZones, setDeliveryZones] = useState<DeliveryZone[]>([]);
+  const [selectedZoneId, setSelectedZoneId] = useState<number | null>(null);
+  const [promotions, setPromotions] = useState<Promotion[]>([]);
+
   useEffect(() => {
     setMounted(true);
+    Promise.all([fetchDeliveryZones(), fetchPublicPromotions()]).then(
+      ([zones, promos]) => {
+        setDeliveryZones(zones);
+        if (zones.length > 0) {
+          setSelectedZoneId(zones[0].id);
+        }
+        setPromotions(promos);
+      }
+    );
   }, []);
 
   if (!mounted) {
@@ -53,10 +77,191 @@ export default function CartPage() {
     );
   }
 
-  const subtotal = getSubtotal();
-  const savings = getTotalSavings();
-  const deliveryFee = 0; // Free delivery in Usasa
-  const totalAmount = subtotal + deliveryFee;
+  // 1. Gross merchandise subtotal before promotions
+  const grossSubtotal = getSubtotal();
+  const mrpSavings = getTotalSavings();
+
+  // 2. Client-side promotional savings  // 2. Authoritative promotion discount estimate
+  let offerSavings = 0;
+  const appliedOfferNames: string[] = [];
+  const remainingQtyMap = new Map<number, number>();
+  for (const it of items) {
+    remainingQtyMap.set(it.productVariantId, it.quantity);
+  }
+
+  const bogoInfoByVariantId = new Map<
+    number,
+    {
+      promoName: string;
+      buyQuantity: number;
+      getQuantity: number;
+      paidQuantity: number;
+      freeQuantity: number;
+      physicalQuantity: number;
+      regularValue: number;
+      offerSavings: number;
+      payable: number;
+    }
+  >();
+
+  const sortedPromos = [...promotions].sort((a, b) => b.priority - a.priority);
+
+  for (const promo of sortedPromos) {
+    // A. Combo estimate
+    if (promo.type === "COMBO" && promo.comboComponents?.length >= 2) {
+      let maxBundles = Number.MAX_SAFE_INTEGER;
+      let allFound = true;
+      for (const comp of promo.comboComponents) {
+        const avail = remainingQtyMap.get(comp.productVariantId) || 0;
+        if (avail < comp.quantity) {
+          allFound = false;
+          break;
+        }
+        maxBundles = Math.min(maxBundles, Math.floor(avail / comp.quantity));
+      }
+
+      if (allFound && maxBundles >= 1) {
+        const comboPrice = parseFloat(promo.comboPrice || "0");
+        let normalSum = 0;
+        for (const comp of promo.comboComponents) {
+          const it = items.find((i) => i.productVariantId === comp.productVariantId);
+          normalSum += (it?.sellingPrice || 0) * comp.quantity;
+        }
+
+        if (normalSum > comboPrice) {
+          const saving = (normalSum - comboPrice) * maxBundles;
+          offerSavings += saving;
+          appliedOfferNames.push(promo.name);
+          for (const comp of promo.comboComponents) {
+            const cur = remainingQtyMap.get(comp.productVariantId)!;
+            remainingQtyMap.set(comp.productVariantId, cur - comp.quantity * maxBundles);
+          }
+        }
+      }
+    }
+
+    // B. BOGO estimate (customer cart qty = paid qty, free qty added automatically)
+    if (promo.type === "BUY_X_GET_Y" && promo.buyQuantity && promo.getQuantity) {
+      const buyQty = promo.buyQuantity;
+      const getQty = promo.getQuantity;
+      const targetVariants = new Set(
+        promo.targets
+          .filter((t) => t.targetType === "VARIANT")
+          .map((t) => t.targetId)
+      );
+      const targetProducts = new Set(
+        promo.targets
+          .filter((t) => t.targetType === "PRODUCT")
+          .map((t) => t.targetId)
+      );
+
+      for (const it of items) {
+        if (
+          targetVariants.has(it.productVariantId) ||
+          targetProducts.has(it.productId)
+        ) {
+          const avail = remainingQtyMap.get(it.productVariantId) || 0;
+          if (avail >= buyQty) {
+            const batches = Math.floor(avail / buyQty);
+            const paidQty = batches * buyQty;
+            const freeQty = batches * getQty;
+            const physicalQty = paidQty + freeQty;
+            const pct = parseFloat(promo.getYDiscountPercent || "100") / 100;
+            const saving = Math.round(freeQty * it.sellingPrice * pct * 100) / 100;
+            offerSavings += saving;
+            appliedOfferNames.push(promo.name);
+            remainingQtyMap.set(it.productVariantId, avail - paidQty);
+
+            bogoInfoByVariantId.set(it.productVariantId, {
+              promoName: promo.name,
+              buyQuantity: buyQty,
+              getQuantity: getQty,
+              paidQuantity: paidQty,
+              freeQuantity: freeQty,
+              physicalQuantity: physicalQty,
+              regularValue: Math.round(physicalQty * it.sellingPrice * 100) / 100,
+              offerSavings: saving,
+              payable: Math.round(paidQty * it.sellingPrice * 100) / 100,
+            });
+          }
+        }
+      }
+    }
+
+    // C. Simple discount estimate
+    if (promo.type === "SIMPLE_DISCOUNT") {
+      if (promo.minOrderAmount && grossSubtotal < parseFloat(promo.minOrderAmount)) {
+        continue;
+      }
+      const targetVariants = new Set(
+        promo.targets
+          .filter((t) => t.targetType === "VARIANT")
+          .map((t) => t.targetId)
+      );
+      const targetProducts = new Set(
+        promo.targets
+          .filter((t) => t.targetType === "PRODUCT")
+          .map((t) => t.targetId)
+      );
+
+      for (const it of items) {
+        if (
+          targetVariants.has(it.productVariantId) ||
+          targetProducts.has(it.productId)
+        ) {
+          const avail = remainingQtyMap.get(it.productVariantId) || 0;
+          if (avail > 0) {
+            let disc = 0;
+            if (promo.discountType === "PERCENTAGE") {
+              disc =
+                avail *
+                it.sellingPrice *
+                (parseFloat(promo.discountValue || "0") / 100);
+            } else if (promo.discountType === "FIXED_AMOUNT") {
+              disc = Math.min(
+                avail * parseFloat(promo.discountValue || "0"),
+                avail * it.sellingPrice
+              );
+            }
+            if (disc > 0) {
+              offerSavings += disc;
+              appliedOfferNames.push(promo.name);
+              remainingQtyMap.set(it.productVariantId, 0);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  offerSavings = Math.round(offerSavings * 100) / 100;
+  const netSubtotal = Math.max(0, grossSubtotal - offerSavings);
+
+  // 3. Delivery Zone calculations evaluated against GROSS subtotal (Phase 4 Preserved)
+  const selectedZone = deliveryZones.find((z) => z.id === selectedZoneId) || null;
+  const minOrderAmount = selectedZone ? parseFloat(selectedZone.minOrderAmount || "0") : 0;
+  const isBelowMinOrder = grossSubtotal < minOrderAmount;
+  const shortfallAmount = Math.max(0, minOrderAmount - grossSubtotal);
+
+  let deliveryCharge = 0;
+  let isFreeDelivery = false;
+  if (selectedZone) {
+    const baseCharge = parseFloat(selectedZone.deliveryCharge || "0");
+    if (selectedZone.freeDeliveryAboveAmount) {
+      const freeThreshold = parseFloat(selectedZone.freeDeliveryAboveAmount);
+      if (grossSubtotal >= freeThreshold) {
+        deliveryCharge = 0;
+        isFreeDelivery = true;
+      } else {
+        deliveryCharge = baseCharge;
+      }
+    } else {
+      deliveryCharge = baseCharge;
+      if (deliveryCharge === 0) isFreeDelivery = true;
+    }
+  }
+
+  const totalAmount = netSubtotal + deliveryCharge;
 
   const handleSubmitOrder = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -66,6 +271,18 @@ export default function CartPage() {
     const cleanPhone = customerPhone.trim().replace(/[^0-9]/g, "");
     if (cleanPhone.length !== 10 || !/^[6-9]/.test(cleanPhone)) {
       setErrorMessage("Please enter a valid 10-digit Indian phone number starting with 6, 7, 8, or 9.");
+      return;
+    }
+
+    if (!selectedZoneId) {
+      setErrorMessage("Please select your delivery area.");
+      return;
+    }
+
+    if (isBelowMinOrder) {
+      setErrorMessage(
+        `Minimum order for ${selectedZone?.name} is ${formatPrice(minOrderAmount)}. Please add ${formatPrice(shortfallAmount)} more items.`
+      );
       return;
     }
 
@@ -80,6 +297,7 @@ export default function CartPage() {
         customerName: customerName.trim(),
         customerPhone: cleanPhone,
         customerAddress: customerAddress.trim(),
+        deliveryZoneId: selectedZoneId,
         paymentMethod,
         items: items.map((i) => ({
           productVariantId: i.productVariantId,
@@ -194,23 +412,66 @@ export default function CartPage() {
                       <p className="text-xs text-neutral-500 mt-0.5">
                         Pack: <span className="font-semibold text-neutral-700">{item.variantUnit}</span> • {formatPrice(item.sellingPrice)} each
                       </p>
-                      <div className="text-sm font-black text-neutral-900 mt-1 sm:hidden">
-                        {formatPrice(lineTotal)}
+
+                      {/* BOGO Offer Breakdown Box */}
+                      {bogoInfoByVariantId.has(item.productVariantId) && (() => {
+                        const bogo = bogoInfoByVariantId.get(item.productVariantId)!;
+                        return (
+                          <div className="mt-2 p-2.5 bg-gradient-to-r from-rose-50 to-amber-50/60 border border-rose-200/80 rounded-xl space-y-1">
+                            <div className="flex items-center gap-1.5 text-xs font-bold text-rose-700">
+                              <Gift className="w-3.5 h-3.5 shrink-0" />
+                              <span>BUY {bogo.buyQuantity} GET {bogo.getQuantity} FREE 🎁</span>
+                            </div>
+                            <p className="text-xs font-bold text-neutral-900">
+                              {bogo.paidQuantity} paid + {bogo.freeQuantity} FREE —{" "}
+                              <span className="text-emerald-700 font-extrabold">
+                                You receive: {bogo.physicalQuantity} units
+                              </span>
+                            </p>
+                            <p className="text-[11px] text-neutral-600">
+                              Regular value:{" "}
+                              <span className="line-through text-neutral-400">
+                                {formatPrice(bogo.regularValue)}
+                              </span>{" "}
+                              • Offer savings:{" "}
+                              <span className="text-emerald-700 font-bold">
+                                -{formatPrice(bogo.offerSavings)}
+                              </span>{" "}
+                              • Payable:{" "}
+                              <span className="text-neutral-900 font-bold">
+                                {formatPrice(bogo.payable)}
+                              </span>
+                            </p>
+                          </div>
+                        );
+                      })()}
+                      <div className="flex items-center justify-between mt-1 sm:hidden">
+                        <span className="text-sm font-black text-neutral-900">
+                          {formatPrice(lineTotal)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => removeItem(item.productVariantId)}
+                          className="text-[11px] text-neutral-400 hover:text-rose-600 font-medium inline-flex items-center gap-0.5 transition cursor-pointer"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          Remove
+                        </button>
                       </div>
                     </div>
 
                     {/* Quantity Controls */}
-                    <div className="flex items-center gap-1.5 bg-neutral-50 border border-neutral-200 rounded-xl p-0.5">
+                    <div className="flex items-center gap-1 sm:gap-1.5 bg-neutral-50 border border-neutral-200 rounded-xl p-0.5 shrink-0">
                       <button
                         type="button"
                         onClick={() =>
                           updateQuantity(item.productVariantId, item.quantity - 1)
                         }
-                        className="w-7 h-7 rounded-lg bg-white flex items-center justify-center hover:bg-neutral-100 font-bold transition shadow-2xs cursor-pointer text-neutral-700"
+                        className="w-7 h-7 sm:w-7 sm:h-7 rounded-lg bg-white flex items-center justify-center hover:bg-neutral-100 font-bold transition shadow-2xs cursor-pointer text-neutral-700"
                       >
                         <Minus className="w-3.5 h-3.5" />
                       </button>
-                      <span className="text-xs font-black px-1.5 min-w-[1.25rem] text-center text-neutral-900">
+                      <span className="text-xs font-black px-1 sm:px-1.5 min-w-[1.25rem] text-center text-neutral-900">
                         {item.quantity}
                       </span>
                       <button
@@ -219,7 +480,7 @@ export default function CartPage() {
                           updateQuantity(item.productVariantId, item.quantity + 1)
                         }
                         disabled={item.quantity >= item.maxStock}
-                        className="w-7 h-7 rounded-lg bg-emerald-700 text-white flex items-center justify-center hover:bg-emerald-800 font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer"
+                        className="w-7 h-7 sm:w-7 sm:h-7 rounded-lg bg-emerald-700 text-white flex items-center justify-center hover:bg-emerald-800 font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer"
                       >
                         <Plus className="w-3.5 h-3.5" />
                       </button>
@@ -313,6 +574,53 @@ export default function CartPage() {
                   </p>
                 </div>
 
+                {/* Delivery Area Dropdown */}
+                <div>
+                  <label className="block font-bold text-neutral-700 mb-1 flex items-center justify-between">
+                    <span className="flex items-center gap-1.5">
+                      <Truck className="w-3.5 h-3.5 text-neutral-400" />
+                      Delivery Area / डिलीवरी क्षेत्र
+                    </span>
+                    {selectedZone && (
+                      <span className="text-[10px] text-emerald-700 font-semibold">
+                        {isFreeDelivery
+                          ? "FREE Delivery"
+                          : `${formatPrice(deliveryCharge)} Delivery`}
+                      </span>
+                    )}
+                  </label>
+                  <select
+                    required
+                    value={selectedZoneId || ""}
+                    onChange={(e) => setSelectedZoneId(Number(e.target.value))}
+                    className="w-full p-2.5 bg-neutral-50/70 border border-neutral-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-emerald-500 focus:outline-hidden text-neutral-800 font-medium cursor-pointer"
+                  >
+                    {deliveryZones.map((zone) => (
+                      <option key={zone.id} value={zone.id}>
+                        {zone.name} {zone.hindiName ? `(${zone.hindiName})` : ""} —{" "}
+                        {parseFloat(zone.deliveryCharge) === 0
+                          ? "Free Delivery"
+                          : `₹${parseFloat(zone.deliveryCharge).toFixed(0)} charge`}
+                        {zone.minOrderAmount && parseFloat(zone.minOrderAmount) > 0
+                          ? ` (Min. ₹${parseFloat(zone.minOrderAmount).toFixed(0)})`
+                          : ""}
+                      </option>
+                    ))}
+                  </select>
+
+                  {selectedZone && selectedZone.freeDeliveryAboveAmount && !isFreeDelivery && (
+                    <p className="text-[10px] text-emerald-700 mt-1 font-medium">
+                      💡 Tip: Add{" "}
+                      <strong>
+                        {formatPrice(
+                          parseFloat(selectedZone.freeDeliveryAboveAmount) - grossSubtotal
+                        )}
+                      </strong>{" "}
+                      more to qualify for FREE delivery!
+                    </p>
+                  )}
+                </div>
+
                 {/* Delivery Address */}
                 <div>
                   <label className="block font-bold text-neutral-700 mb-1 flex items-center gap-1.5">
@@ -400,17 +708,40 @@ export default function CartPage() {
                 {/* Order Summary breakdown */}
                 <div className="pt-3 border-t border-neutral-100 space-y-1.5 text-xs">
                   <div className="flex justify-between text-neutral-600">
-                    <span>Items Subtotal</span>
-                    <span className="font-semibold text-neutral-900">{formatPrice(subtotal)}</span>
+                    <span>Items Gross Subtotal</span>
+                    <span className="font-semibold text-neutral-900">{formatPrice(grossSubtotal)}</span>
                   </div>
+                  {offerSavings > 0 && (
+                    <div className="flex justify-between text-rose-700 font-bold bg-rose-50/80 px-2 py-1 rounded-lg">
+                      <span className="flex items-center gap-1">
+                        <Tag className="w-3 h-3 text-rose-600" />
+                        Special Offer Savings
+                      </span>
+                      <span>- {formatPrice(offerSavings)}</span>
+                    </div>
+                  )}
+                  {offerSavings > 0 && (
+                    <div className="flex justify-between text-neutral-600">
+                      <span>Net Subtotal</span>
+                      <span className="font-semibold text-neutral-900">{formatPrice(netSubtotal)}</span>
+                    </div>
+                  )}
                   <div className="flex justify-between text-neutral-600">
                     <span>Delivery Charge</span>
-                    <span className="font-semibold text-emerald-700">FREE</span>
+                    {isFreeDelivery ? (
+                      <span className="font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded">
+                        FREE
+                      </span>
+                    ) : (
+                      <span className="font-semibold text-neutral-800">
+                        {formatPrice(deliveryCharge)}
+                      </span>
+                    )}
                   </div>
-                  {savings > 0 && (
+                  {mrpSavings > 0 && (
                     <div className="flex justify-between text-emerald-700 font-semibold">
                       <span>Total Savings</span>
-                      <span>- {formatPrice(savings)}</span>
+                      <span>- {formatPrice(mrpSavings + offerSavings)}</span>
                     </div>
                   )}
                   <div className="flex justify-between text-sm font-black text-neutral-900 pt-2 border-t border-neutral-200">
@@ -419,18 +750,30 @@ export default function CartPage() {
                   </div>
                 </div>
 
+                {/* Shortfall Alert if below minimum order for selected zone */}
+                {isBelowMinOrder && selectedZone && (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center gap-2 font-medium">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                    <span>
+                      Minimum order for <strong>{selectedZone.name}</strong> is{" "}
+                      <strong>{formatPrice(minOrderAmount)}</strong>. Please add{" "}
+                      <strong>{formatPrice(shortfallAmount)}</strong> more to place your order.
+                    </span>
+                  </div>
+                )}
+
                 {/* Submit Order via WhatsApp */}
                 <button
                   type="submit"
-                  disabled={loading}
-                  className="w-full mt-4 bg-emerald-700 hover:bg-emerald-800 disabled:bg-emerald-400 text-white font-bold py-3 px-4 rounded-xl shadow-md shadow-emerald-700/20 text-sm flex items-center justify-center gap-2 transition cursor-pointer"
+                  disabled={loading || isBelowMinOrder}
+                  className="w-full mt-4 bg-emerald-700 hover:bg-emerald-800 disabled:bg-neutral-300 disabled:text-neutral-500 disabled:cursor-not-allowed text-white font-bold py-3 px-4 rounded-xl shadow-md shadow-emerald-700/20 text-sm flex items-center justify-center gap-2 transition cursor-pointer"
                 >
                   {loading ? (
                     <span>Placing Order...</span>
+                  ) : isBelowMinOrder ? (
+                    <span>Add {formatPrice(shortfallAmount)} More to Order</span>
                   ) : (
-                    <>
-                      <span>Place Order & Open WhatsApp</span>
-                    </>
+                    <span>Place Order & Open WhatsApp</span>
                   )}
                 </button>
               </form>

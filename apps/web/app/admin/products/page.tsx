@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { formatPrice } from "@/lib/utils";
-import { Product, Category, ProductVariant } from "@/lib/api";
+import { Product, Category, ProductVariant, adminFetch, uploadAdminImage } from "@/lib/api";
 import {
   Plus,
   Edit2,
@@ -13,6 +13,8 @@ import {
   Sparkles,
   AlertTriangle,
   X,
+  Upload,
+  Loader2,
 } from "lucide-react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000/api/v1";
@@ -55,11 +57,32 @@ export default function AdminProductsPage() {
     currentStock: "10",
   });
 
+  // Image upload state
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  const handleImageFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadingImage(true);
+    setUploadError(null);
+
+    const res = await uploadAdminImage(file);
+    setUploadingImage(false);
+
+    if (res.success && res.url) {
+      setNewProduct((prev) => ({ ...prev, imageUrl: res.url! }));
+    } else {
+      setUploadError(res.message || "Failed to upload image.");
+    }
+  };
+
   const loadData = async () => {
     try {
       setLoading(true);
       const [prodsRes, catsRes] = await Promise.all([
-        fetch(`${API_URL}/admin/products`),
+        adminFetch(`${API_URL}/admin/products`),
         fetch(`${API_URL}/catalog/categories`),
       ]);
       const prodsJson = await prodsRes.json();
@@ -96,7 +119,7 @@ export default function AdminProductsPage() {
   const toggleProductStatus = async (product: Product) => {
     const newStatus = product.status === "ACTIVE" ? "ARCHIVED" : "ACTIVE";
     try {
-      const res = await fetch(`${API_URL}/admin/products/${product.id}`, {
+      const res = await adminFetch(`${API_URL}/admin/products/${product.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: newStatus }),
@@ -137,7 +160,7 @@ export default function AdminProductsPage() {
         ],
       };
 
-      const res = await fetch(`${API_URL}/admin/products`, {
+      const res = await adminFetch(`${API_URL}/admin/products`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -160,7 +183,7 @@ export default function AdminProductsPage() {
     if (!editingVariant) return;
 
     try {
-      const res = await fetch(
+      const res = await adminFetch(
         `${API_URL}/admin/products/${editingVariant.productId}/variants/${editingVariant.variant.id}`,
         {
           method: "PUT",
@@ -190,7 +213,7 @@ export default function AdminProductsPage() {
     if (!addingVariantForProduct) return;
 
     try {
-      const res = await fetch(
+      const res = await adminFetch(
         `${API_URL}/admin/products/${addingVariantForProduct}/variants`,
         {
           method: "POST",
@@ -226,25 +249,25 @@ export default function AdminProductsPage() {
   return (
     <div className="space-y-6">
       {/* Top Action Bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-neutral-200/80 shadow-xs">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4 bg-white p-4 sm:p-6 rounded-2xl border border-neutral-200/80 shadow-xs">
         <div>
-          <h1 className="text-2xl font-black text-neutral-900 flex items-center gap-2.5">
-            <Package className="w-7 h-7 text-emerald-700" />
-            Product Catalog Management
+          <h1 className="text-xl sm:text-2xl font-black text-neutral-900 flex items-center gap-2 sm:gap-2.5">
+            <Package className="w-6 h-6 sm:w-7 sm:h-7 text-emerald-700 shrink-0" />
+            <span>Product Catalog</span>
           </h1>
           <p className="text-xs text-neutral-500 mt-1">
             Manage store inventory, pack sizes, MRP, selling price, and active status.
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center justify-between sm:justify-end gap-2.5 sm:gap-3 w-full sm:w-auto">
           {/* Status Filter */}
-          <div className="flex bg-neutral-100 p-1 rounded-xl text-xs font-semibold">
+          <div className="flex bg-neutral-100 p-1 rounded-xl text-xs font-semibold shrink-0">
             {(["ALL", "ACTIVE", "ARCHIVED"] as const).map((s) => (
               <button
                 key={s}
                 onClick={() => setFilterStatus(s)}
-                className={`px-3 py-1.5 rounded-lg transition ${
+                className={`px-2.5 sm:px-3 py-1.5 rounded-lg transition cursor-pointer ${
                   filterStatus === s
                     ? "bg-white text-neutral-900 shadow-xs"
                     : "text-neutral-500 hover:text-neutral-800"
@@ -258,10 +281,10 @@ export default function AdminProductsPage() {
           {/* Add Product Button */}
           <button
             onClick={() => setIsAddProductOpen(true)}
-            className="inline-flex items-center gap-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold px-4 py-2 rounded-xl transition shadow-xs cursor-pointer"
+            className="inline-flex items-center gap-1.5 sm:gap-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold px-3.5 sm:px-4 py-2 rounded-xl transition shadow-xs cursor-pointer shrink-0"
           >
             <Plus className="w-4 h-4" />
-            Add Product
+            <span>Add Product</span>
           </button>
         </div>
       </div>
@@ -501,16 +524,59 @@ export default function AdminProductsPage() {
               </div>
 
               <div>
-                <label className="block font-bold text-neutral-700 mb-1">Image URL</label>
-                <input
-                  type="url"
-                  placeholder="https://..."
-                  value={newProduct.imageUrl}
-                  onChange={(e) =>
-                    setNewProduct({ ...newProduct, imageUrl: e.target.value })
-                  }
-                  className="w-full p-2.5 bg-neutral-50 border border-neutral-200 rounded-xl"
-                />
+                <label className="block font-bold text-neutral-700 mb-1">Product Image</label>
+
+                {/* File Upload Zone */}
+                <div className="flex items-center gap-3 mb-2">
+                  <label className="flex items-center gap-2 px-3.5 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-xl cursor-pointer text-xs font-semibold transition shadow-2xs">
+                    {uploadingImage ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-700" />
+                        <span>Uploading...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Upload className="w-3.5 h-3.5 text-emerald-700" />
+                        <span>Upload Image File</span>
+                      </>
+                    )}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      disabled={uploadingImage}
+                      onChange={handleImageFileChange}
+                      className="hidden"
+                    />
+                  </label>
+                  {newProduct.imageUrl && (
+                    <div className="flex items-center gap-2 text-xs text-emerald-700 font-medium bg-emerald-50/50 px-2 py-1 rounded-lg border border-emerald-200">
+                      <img
+                        src={newProduct.imageUrl}
+                        alt="Preview"
+                        className="w-7 h-7 rounded-md object-cover border border-emerald-300"
+                      />
+                      <span>Attached</span>
+                    </div>
+                  )}
+                </div>
+
+                {uploadError && (
+                  <p className="text-xs text-red-600 mb-2 font-medium">{uploadError}</p>
+                )}
+
+                {/* Manual URL input fallback */}
+                <div className="space-y-1">
+                  <span className="text-[11px] text-neutral-400 block">Or paste image URL directly (fallback):</span>
+                  <input
+                    type="url"
+                    placeholder="https://..."
+                    value={newProduct.imageUrl}
+                    onChange={(e) =>
+                      setNewProduct({ ...newProduct, imageUrl: e.target.value })
+                    }
+                    className="w-full p-2.5 bg-neutral-50 border border-neutral-200 rounded-xl text-xs text-neutral-800 focus:bg-white focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
               </div>
 
               {/* Initial Variant */}

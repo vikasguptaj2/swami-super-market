@@ -19,6 +19,7 @@ export const createOrderSchema = z.object({
     .string()
     .trim()
     .min(5, "Please enter your complete address (Village/Mohalla, Usasa or nearby)"),
+  deliveryZoneId: z.coerce.number().int().positive("Please select a delivery zone"),
   paymentMethod: z.enum(PAYMENT_METHODS),
   items: z
     .array(createOrderItemSchema)

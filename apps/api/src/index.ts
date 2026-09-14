@@ -12,7 +12,6 @@ async function start() {
   try {
     await app.listen({ port: PORT, host: HOST });
     console.log(`🚀 Fastify server listening at http://localhost:${PORT}`);
-    console.log(`📱 WhatsApp Orders Store Phone: +${process.env.STORE_WHATSAPP_PHONE}`);
   } catch (err) {
     app.log.error(err);
     process.exit(1);

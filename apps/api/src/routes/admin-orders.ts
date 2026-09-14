@@ -6,6 +6,7 @@ import {
   orderStatusHistory,
   productVariants,
   inventoryMovements,
+  promotions,
   eq,
   desc,
   and,
@@ -45,6 +46,13 @@ class InsufficientStockError extends Error {
   }
 }
 
+class PromotionUsageExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PromotionUsageExceededError";
+  }
+}
+
 export async function adminOrderRoutes(app: FastifyInstance) {
   // 1. GET /api/v1/admin/orders — list all orders with filter & search
   app.get("/", async (request, reply) => {
@@ -79,6 +87,7 @@ export async function adminOrderRoutes(app: FastifyInstance) {
         customerName: orders.customerName,
         customerPhone: orders.customerPhone,
         customerAddress: orders.customerAddress,
+        deliveryZoneId: orders.deliveryZoneId,
         subtotal: orders.subtotal,
         deliveryCharge: orders.deliveryCharge,
         totalAmount: orders.totalAmount,
@@ -127,10 +136,15 @@ export async function adminOrderRoutes(app: FastifyInstance) {
         id: orderItems.id,
         orderId: orderItems.orderId,
         productVariantId: orderItems.productVariantId,
+        promotionId: orderItems.promotionId,
+        promotionTypeSnapshot: orderItems.promotionTypeSnapshot,
+        discountAmount: orderItems.discountAmount,
         productNameSnapshot: orderItems.productNameSnapshot,
         variantUnitSnapshot: orderItems.variantUnitSnapshot,
         unitPriceSnapshot: orderItems.unitPriceSnapshot,
         quantity: orderItems.quantity,
+        paidQuantity: orderItems.paidQuantity,
+        freeQuantity: orderItems.freeQuantity,
         lineTotal: orderItems.lineTotal,
         currentVariantStock: productVariants.currentStock,
       })
@@ -201,12 +215,66 @@ export async function adminOrderRoutes(app: FastifyInstance) {
           );
         }
 
-        // Step C: Handle CONFIRMED (atomic pre-check and stock deduction)
+        // Step C: Handle CONFIRMED (atomic pre-check, usage limit lock, and physical stock deduction)
         if (newStatus === "CONFIRMED") {
           const items = await tx
             .select()
             .from(orderItems)
             .where(eq(orderItems.orderId, currentOrder.id));
+
+          // 1. Concurrency-safe promotion usage limit enforcement (DO NOT recalculate promotions!)
+          const appliedPromoIds = [
+            ...new Set(
+              items
+                .map((i) => i.promotionId)
+                .filter((id): id is number => id !== null && id !== undefined)
+            ),
+          ];
+
+          for (const promoId of appliedPromoIds) {
+            const [promo] = await tx
+              .select()
+              .from(promotions)
+              .where(eq(promotions.id, promoId))
+              .for("update");
+
+            if (promo && promo.usageLimit !== null && promo.timesUsed >= promo.usageLimit) {
+              throw new PromotionUsageExceededError(
+                `Cannot confirm order: Promotion "${promo.name}" has reached its usage limit (${promo.usageLimit}).`
+              );
+            }
+
+            if (promo) {
+              await tx
+                .update(promotions)
+                .set({ timesUsed: promo.timesUsed + 1, updatedAt: new Date() })
+                .where(eq(promotions.id, promo.id));
+            }
+          }
+
+          // 2. Aggregate physical quantities across split order-item rows by variant ID
+          const physicalRequirements = new Map<
+            number,
+            {
+              required: number;
+              productName: string;
+              unit: string;
+            }
+          >();
+
+          for (const item of items) {
+            if (!item.productVariantId) continue;
+            const cur = physicalRequirements.get(item.productVariantId);
+            if (cur) {
+              cur.required += item.quantity;
+            } else {
+              physicalRequirements.set(item.productVariantId, {
+                required: item.quantity,
+                productName: item.productNameSnapshot,
+                unit: item.variantUnitSnapshot,
+              });
+            }
+          }
 
           const shortItems: Array<{
             variantId: number;
@@ -218,56 +286,51 @@ export async function adminOrderRoutes(app: FastifyInstance) {
 
           const variantStockMap = new Map<number, number>();
 
-          // Pre-check all variants with row lock
-          for (const item of items) {
-            // If productVariantId is null (e.g., variant archived/deleted after ordering),
-            // snapshot fields preserve order truth and stock deduction is safely skipped.
-            if (!item.productVariantId) continue;
-
+          // 3. Pre-check all variants with row lock FOR UPDATE
+          for (const [variantId, req] of physicalRequirements.entries()) {
             const [variant] = await tx
               .select({
                 id: productVariants.id,
                 currentStock: productVariants.currentStock,
               })
               .from(productVariants)
-              .where(eq(productVariants.id, item.productVariantId))
+              .where(eq(productVariants.id, variantId))
               .for("update");
 
             const available = variant?.currentStock ?? 0;
-            if (!variant || available < item.quantity) {
+            if (!variant || available < req.required) {
               shortItems.push({
-                variantId: item.productVariantId,
-                productName: item.productNameSnapshot,
-                unit: item.variantUnitSnapshot,
-                required: item.quantity,
+                variantId,
+                productName: req.productName,
+                unit: req.unit,
+                required: req.required,
                 available,
               });
             } else {
-              variantStockMap.set(item.productVariantId, available);
+              variantStockMap.set(variantId, available);
             }
           }
 
-          // If ANY item has insufficient stock, roll back the whole transaction
+          // If ANY physical item has insufficient stock, roll back the whole transaction
           if (shortItems.length > 0) {
             throw new InsufficientStockError(shortItems);
           }
 
-          // Deduct stock and insert inventory_movements
-          for (const item of items) {
-            if (!item.productVariantId) continue;
-            const available = variantStockMap.get(item.productVariantId)!;
+          // 4. Deduct physical stock and insert inventory_movements
+          for (const [variantId, req] of physicalRequirements.entries()) {
+            const available = variantStockMap.get(variantId)!;
 
             await tx
               .update(productVariants)
               .set({
-                currentStock: available - item.quantity,
+                currentStock: available - req.required,
                 updatedAt: new Date(),
               })
-              .where(eq(productVariants.id, item.productVariantId));
+              .where(eq(productVariants.id, variantId));
 
             await tx.insert(inventoryMovements).values({
-              productVariantId: item.productVariantId,
-              quantityChange: -item.quantity,
+              productVariantId: variantId,
+              quantityChange: -req.required,
               reason: "ORDER_CONFIRMED",
               orderId: currentOrder.id,
               note: `Stock deducted on order confirmation (${currentOrder.orderCode})`,
@@ -275,7 +338,7 @@ export async function adminOrderRoutes(app: FastifyInstance) {
           }
         }
 
-        // Step D: Handle CANCELLED (restore stock if previously deducted)
+        // Step D: Handle CANCELLED (restore physical stock and decrement promotion usage if previously confirmed)
         if (newStatus === "CANCELLED") {
           if (
             currentOrder.status === "CONFIRMED" ||
@@ -286,41 +349,65 @@ export async function adminOrderRoutes(app: FastifyInstance) {
               .from(orderItems)
               .where(eq(orderItems.orderId, currentOrder.id));
 
+            // Aggregate physical quantities across split rows
+            const physicalRequirements = new Map<number, number>();
             for (const item of items) {
-              // If variant was deleted, skip restoring physical stock
               if (!item.productVariantId) continue;
+              const cur = physicalRequirements.get(item.productVariantId) || 0;
+              physicalRequirements.set(item.productVariantId, cur + item.quantity);
+            }
 
+            for (const [variantId, restoredQty] of physicalRequirements.entries()) {
               const [variant] = await tx
                 .select({
                   id: productVariants.id,
                   currentStock: productVariants.currentStock,
                 })
                 .from(productVariants)
-                .where(eq(productVariants.id, item.productVariantId))
+                .where(eq(productVariants.id, variantId))
                 .for("update");
 
               if (variant) {
-                const restoredStock = variant.currentStock + item.quantity;
+                const newStock = variant.currentStock + restoredQty;
 
                 await tx
                   .update(productVariants)
                   .set({
-                    currentStock: restoredStock,
+                    currentStock: newStock,
                     updatedAt: new Date(),
                   })
-                  .where(eq(productVariants.id, item.productVariantId));
+                  .where(eq(productVariants.id, variantId));
 
                 await tx.insert(inventoryMovements).values({
-                  productVariantId: item.productVariantId,
-                  quantityChange: item.quantity,
+                  productVariantId: variantId,
+                  quantityChange: restoredQty,
                   reason: "ORDER_CANCELLED",
                   orderId: currentOrder.id,
                   note: `Stock restored on order cancellation (${currentOrder.orderCode}, previous: ${currentOrder.status})`,
                 });
               }
             }
+
+            // Decrement timesUsed for any applied promotions
+            const appliedPromoIds = [
+              ...new Set(
+                items
+                  .map((i) => i.promotionId)
+                  .filter((id): id is number => id !== null && id !== undefined)
+              ),
+            ];
+
+            for (const promoId of appliedPromoIds) {
+              await tx
+                .update(promotions)
+                .set({
+                  timesUsed: sql`GREATEST(0, ${promotions.timesUsed} - 1)`,
+                  updatedAt: new Date(),
+                })
+                .where(eq(promotions.id, promoId));
+            }
           }
-          // If cancelled from PENDING_WHATSAPP, stock was never deducted.
+          // If cancelled from PENDING_WHATSAPP, stock and usage were never consumed.
         }
 
         // Step E: Handle DELIVERED payment status update
@@ -346,11 +433,16 @@ export async function adminOrderRoutes(app: FastifyInstance) {
           .where(eq(orders.id, currentOrder.id))
           .returning();
 
+        const adminUser =
+          request.session?.get("adminUser") ||
+          request.session?.adminUser;
+
         // Step G: Record in order_status_history
         await tx.insert(orderStatusHistory).values({
           orderId: currentOrder.id,
           status: newStatus,
           note: note?.trim() || null,
+          changedByAdminId: adminUser?.id || null,
         });
 
         return resultOrder;
@@ -383,6 +475,13 @@ export async function adminOrderRoutes(app: FastifyInstance) {
           message:
             "Cannot confirm order due to insufficient stock on one or more items.",
           shortItems: error.shortItems,
+        });
+      }
+      if (error instanceof PromotionUsageExceededError) {
+        return reply.status(409).send({
+          success: false,
+          error: "PROMOTION_USAGE_LIMIT_EXCEEDED",
+          message: error.message,
         });
       }
 

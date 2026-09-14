@@ -20,7 +20,9 @@ import {
   AlertTriangle,
   ChevronRight,
   Info,
+  Gift,
 } from "lucide-react";
+import { adminFetch } from "@/lib/api";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000/api/v1";
 
@@ -58,7 +60,12 @@ interface OrderDetailItem {
   productNameSnapshot: string;
   variantUnitSnapshot: string;
   unitPriceSnapshot: string;
-  quantity: number;
+  quantity: number; // TOTAL PHYSICAL UNITS
+  paidQuantity?: number;
+  freeQuantity?: number;
+  promotionId?: number | null;
+  promotionTypeSnapshot?: string | null;
+  discountAmount?: string;
   lineTotal: string;
   currentVariantStock?: number | null;
 }
@@ -157,7 +164,7 @@ export default function AdminOrdersPage() {
       if (filterStatus !== "ALL") params.append("status", filterStatus);
       if (searchQuery.trim()) params.append("search", searchQuery.trim());
 
-      const res = await fetch(`${API_URL}/admin/orders?${params.toString()}`);
+      const res = await adminFetch(`${API_URL}/admin/orders?${params.toString()}`);
       const data = await res.json();
       if (data.success) {
         setOrders(data.data || []);
@@ -186,7 +193,7 @@ export default function AdminOrdersPage() {
       setActionError(null);
       setTransitionNote("");
 
-      const res = await fetch(`${API_URL}/admin/orders/${id}`);
+      const res = await adminFetch(`${API_URL}/admin/orders/${id}`);
       const data = await res.json();
       if (data.success) {
         setOrderDetail(data.data);
@@ -206,7 +213,7 @@ export default function AdminOrdersPage() {
     setTransitioning(true);
 
     try {
-      const res = await fetch(
+      const res = await adminFetch(
         `${API_URL}/admin/orders/${orderDetail.id}/status`,
         {
           method: "PATCH",
@@ -260,32 +267,32 @@ export default function AdminOrdersPage() {
   return (
     <div className="space-y-6">
       {/* Top Header Card */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-6 rounded-2xl border border-neutral-200/80 shadow-xs">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-4 sm:p-6 rounded-2xl border border-neutral-200/80 shadow-xs">
         <div>
-          <h1 className="text-2xl font-black text-neutral-900 flex items-center gap-2.5">
-            <ClipboardList className="w-7 h-7 text-emerald-700" />
-            Order Management & Fulfillment
+          <h1 className="text-xl sm:text-2xl font-black text-neutral-900 flex items-center gap-2 sm:gap-2.5">
+            <ClipboardList className="w-6 h-6 sm:w-7 sm:h-7 text-emerald-700 shrink-0" />
+            <span>Order Management</span>
           </h1>
           <p className="text-xs text-neutral-500 mt-1">
             Review customer orders, verify items, confirm stock, and track local delivery.
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
-          <form onSubmit={handleSearchSubmit} className="relative">
+        <div className="flex items-center gap-2 sm:gap-3 w-full md:w-auto">
+          <form onSubmit={handleSearchSubmit} className="relative flex-1 md:flex-initial">
             <input
               type="text"
               placeholder="Search code or phone..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-56 pl-9 pr-3 py-2 text-xs rounded-xl border border-neutral-200 focus:outline-hidden focus:border-emerald-600 bg-neutral-50"
+              className="w-full md:w-56 pl-9 pr-3 py-2 text-xs rounded-xl border border-neutral-200 focus:outline-hidden focus:border-emerald-600 bg-neutral-50"
             />
-            <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-2.5" />
+            <Search className="w-4 h-4 text-neutral-400 absolute left-3 top-2.5 pointer-events-none" />
           </form>
 
           <button
             onClick={fetchOrders}
-            className="p-2 text-neutral-600 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 rounded-xl transition"
+            className="p-2 text-neutral-600 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 rounded-xl transition shrink-0 cursor-pointer"
             title="Refresh list"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
@@ -294,7 +301,7 @@ export default function AdminOrdersPage() {
       </div>
 
       {/* Filter Tabs */}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex items-center gap-1.5 sm:gap-2 overflow-x-auto pb-1 -mx-4 px-4 sm:mx-0 sm:px-0">
         {(
           [
             "ALL",
@@ -310,7 +317,7 @@ export default function AdminOrdersPage() {
             <button
               key={status}
               onClick={() => setFilterStatus(status)}
-              className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 ${
+              className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition shrink-0 flex items-center gap-1.5 cursor-pointer ${
                 isActive
                   ? "bg-neutral-900 text-white shadow-xs"
                   : "bg-white text-neutral-600 hover:bg-neutral-100 border border-neutral-200"
@@ -429,8 +436,8 @@ export default function AdminOrdersPage() {
 
       {/* Order Detail Modal / Drawer */}
       {selectedOrderId && (
-        <div className="fixed inset-0 z-50 bg-neutral-900/50 backdrop-blur-xs flex items-center justify-center p-4 sm:p-6 overflow-y-auto">
-          <div className="bg-white w-full max-w-3xl rounded-2xl shadow-xl border border-neutral-200 overflow-hidden my-8 max-h-[90vh] flex flex-col">
+        <div className="fixed inset-0 z-50 bg-neutral-900/60 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4 lg:p-6 overflow-y-auto">
+          <div className="bg-white w-full max-w-3xl rounded-2xl sm:rounded-3xl shadow-2xl border border-neutral-200 overflow-hidden my-auto max-h-[94vh] flex flex-col">
             {detailLoading || !orderDetail ? (
               <div className="py-24 text-center text-sm text-neutral-500">
                 <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-emerald-600" />
@@ -439,10 +446,10 @@ export default function AdminOrdersPage() {
             ) : (
               <>
                 {/* Modal Header */}
-                <div className="p-6 border-b border-neutral-100 flex items-start justify-between bg-neutral-50/50">
-                  <div>
-                    <div className="flex items-center gap-3">
-                      <h2 className="text-xl font-black text-neutral-900">
+                <div className="p-4 sm:p-6 border-b border-neutral-100 flex items-start justify-between bg-neutral-50/50 gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+                      <h2 className="text-lg sm:text-xl font-black text-neutral-900">
                         {orderDetail.orderCode}
                       </h2>
                       {(() => {
@@ -611,16 +618,38 @@ export default function AdminOrdersPage() {
                           {orderDetail.items.map((item) => (
                             <tr key={item.id} className="hover:bg-neutral-50/50">
                               <td className="py-2.5 px-3 font-semibold text-neutral-900">
-                                {item.productNameSnapshot}
+                                <div>{item.productNameSnapshot}</div>
+                                {item.freeQuantity && item.freeQuantity > 0 ? (
+                                  <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-md">
+                                    <Gift className="w-3 h-3" />
+                                    BUY {item.paidQuantity} GET {item.freeQuantity} FREE
+                                  </div>
+                                ) : null}
                               </td>
                               <td className="py-2.5 px-3 text-neutral-600">
                                 {item.variantUnitSnapshot}
                               </td>
                               <td className="py-2.5 px-3 text-neutral-600">
-                                {formatPrice(item.unitPriceSnapshot)}
+                                <div>{formatPrice(item.unitPriceSnapshot)}</div>
+                                {item.discountAmount && parseFloat(item.discountAmount) > 0 && (
+                                  <div className="text-[10px] text-emerald-700 font-semibold">
+                                    Savings: -{formatPrice(item.discountAmount)}
+                                  </div>
+                                )}
                               </td>
-                              <td className="py-2.5 px-3 font-bold text-neutral-900">
-                                {item.quantity}
+                              <td className="py-2.5 px-3">
+                                {item.freeQuantity && item.freeQuantity > 0 ? (
+                                  <div>
+                                    <span className="inline-flex items-center px-1.5 py-0.5 bg-emerald-100 text-emerald-900 rounded font-black text-xs">
+                                      {item.quantity} to pack
+                                    </span>
+                                    <div className="text-[10px] text-neutral-500 font-medium mt-0.5">
+                                      ({item.paidQuantity} paid + {item.freeQuantity} free)
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <span className="font-bold text-neutral-900">{item.quantity}</span>
+                                )}
                               </td>
                               <td className="py-2.5 px-3">
                                 {typeof item.currentVariantStock === "number" ? (

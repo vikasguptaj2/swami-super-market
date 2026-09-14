@@ -4,6 +4,8 @@ import {
   categories,
   products,
   productVariants,
+  deliveryZones,
+  storeSettings,
   eq,
   and,
   desc,
@@ -23,6 +25,35 @@ export async function catalogRoutes(app: FastifyInstance) {
       .orderBy(asc(categories.displayOrder));
 
     return { success: true, data: list };
+  });
+
+  // 1.1 List all active delivery zones sorted by displayOrder
+  app.get("/delivery-zones", async (request, reply) => {
+    const list = await db
+      .select()
+      .from(deliveryZones)
+      .where(eq(deliveryZones.isActive, true))
+      .orderBy(asc(deliveryZones.displayOrder));
+
+    return { success: true, data: list };
+  });
+
+  // 1.2 Get store settings (singleton)
+  app.get("/store-settings", async (request, reply) => {
+    const [settings] = await db
+      .select()
+      .from(storeSettings)
+      .where(eq(storeSettings.id, 1))
+      .limit(1);
+
+    if (!settings) {
+      return reply.status(404).send({
+        success: false,
+        message: "Store settings not configured yet",
+      });
+    }
+
+    return { success: true, data: settings };
   });
 
   // 2. Get category by slug + products under it with variants

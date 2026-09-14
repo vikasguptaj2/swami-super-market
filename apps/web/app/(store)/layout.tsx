@@ -1,4 +1,6 @@
 import { Header } from "@/components/store/Header";
+import { Footer } from "@/components/store/Footer";
+import { MobileCartBar } from "@/components/store/MobileCartBar";
 
 export default function StoreLayout({
   children,
@@ -6,16 +8,13 @@ export default function StoreLayout({
   children: React.ReactNode;
 }) {
   return (
-    <div className="min-h-screen flex flex-col bg-neutral-50/50">
+    <div className="min-h-screen flex flex-col bg-neutral-50/60 selection:bg-emerald-100 selection:text-emerald-950">
       <Header />
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-6">
         {children}
       </main>
-      <footer className="bg-white border-t border-neutral-200 mt-12 py-8 text-center text-xs text-neutral-500">
-        <p className="font-semibold text-neutral-700">Swami Super Market • स्वामी सुपर मार्केट</p>
-        <p className="mt-1">Usasa, Ballia, Uttar Pradesh • उसासा, बलिया (उ.प्र.)</p>
-        <p className="mt-2 text-[11px] text-neutral-400">Phase 1: Catalog Core & Search • Designed for Local Daily Needs</p>
-      </footer>
+      <Footer />
+      <MobileCartBar />
     </div>
   );
 }

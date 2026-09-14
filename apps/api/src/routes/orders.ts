@@ -6,15 +6,47 @@ import {
   orderStatusHistory,
   productVariants,
   products,
+  deliveryZones,
+  promotions,
+  promotionTargets,
+  promotionComboComponents,
   eq,
   inArray,
 } from "@swami/database";
 import { createOrderSchema } from "@swami/shared";
 import { sendOrderNotification } from "../services/whatsapp/index.js";
+import {
+  calculateCartPromotions,
+  CartVariantItem,
+} from "../services/promotions/index.js";
+
+class OrderValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OrderValidationError";
+  }
+}
 
 export async function orderRoutes(app: FastifyInstance) {
-  // 1. Create order
-  app.post("/", async (request, reply) => {
+  // 1. Create order — rate-limited to 10 orders per 10 minutes per client IP to prevent automated spam
+  app.post(
+    "/",
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: "10 minutes",
+          hook: "preHandler",
+          allowList: (req: any) => req.method === "OPTIONS",
+          errorResponseBuilder: (req: any, context: any) => ({
+            statusCode: 429,
+            error: "RATE_LIMIT_EXCEEDED",
+            message: `Too many orders placed from this network. Please wait ${context.after} before trying again.`,
+          }),
+        },
+      },
+    },
+    async (request, reply) => {
     const parseResult = createOrderSchema.safeParse(request.body);
     if (!parseResult.success) {
       return reply.status(400).send({
@@ -24,12 +56,18 @@ export async function orderRoutes(app: FastifyInstance) {
       });
     }
 
-    const { customerName, customerPhone, customerAddress, paymentMethod, items } =
-      parseResult.data;
+    const {
+      customerName,
+      customerPhone,
+      customerAddress,
+      deliveryZoneId,
+      paymentMethod,
+      items,
+    } = parseResult.data;
 
     const variantIds = items.map((i) => i.productVariantId);
 
-    // 2. Fetch all requested variants and their parent products
+    // 2. Fetch all requested variants and their parent products (including categoryId)
     const requestedVariants = await db
       .select({
         variantId: productVariants.id,
@@ -40,6 +78,7 @@ export async function orderRoutes(app: FastifyInstance) {
         isActive: productVariants.isActive,
         productId: products.id,
         productName: products.name,
+        categoryId: products.categoryId,
         productStatus: products.status,
       })
       .from(productVariants)
@@ -48,17 +87,8 @@ export async function orderRoutes(app: FastifyInstance) {
 
     const variantMap = new Map(requestedVariants.map((v) => [v.variantId, v]));
 
-    // 3. Stock check & validation (Rule 3: stock is NOT deducted now)
-    const orderItemSnapshots: {
-      productVariantId: number;
-      productName: string;
-      variantUnit: string;
-      unitPrice: string;
-      quantity: number;
-      lineTotal: string;
-    }[] = [];
-
-    let calculatedSubtotal = 0;
+    // 3. Stock check & construct cart items for authoritative calculation
+    const cartVariantItems: CartVariantItem[] = [];
 
     for (const item of items) {
       const variant = variantMap.get(item.productVariantId);
@@ -79,118 +109,230 @@ export async function orderRoutes(app: FastifyInstance) {
         });
       }
 
-      const unitPriceNum = parseFloat(variant.sellingPrice);
-      const lineTotalNum = unitPriceNum * item.quantity;
-      calculatedSubtotal += lineTotalNum;
-
-      orderItemSnapshots.push({
+      cartVariantItems.push({
         productVariantId: variant.variantId,
+        productId: variant.productId,
+        categoryId: variant.categoryId,
+        sellingPrice: parseFloat(variant.sellingPrice),
+        quantity: item.quantity,
         productName: variant.productName,
         variantUnit: variant.unit,
-        unitPrice: unitPriceNum.toFixed(2),
-        quantity: item.quantity,
-        lineTotal: lineTotalNum.toFixed(2),
       });
     }
 
-    const deliveryChargeNum = 0.0; // V1 free delivery in Usasa
-    const totalAmountNum = calculatedSubtotal + deliveryChargeNum;
+    // 4. Fetch active promotions, targets, and combo components
+    const activePromos = await db
+      .select()
+      .from(promotions)
+      .where(eq(promotions.status, "ACTIVE"));
 
-    // 4. Atomic transaction: create order, orderCode, order_items, order_status_history
-    const { createdOrder, insertedItems } = await db.transaction(async (tx) => {
-      // Insert order with initial placeholder code
-      const [newOrder] = await tx
-        .insert(orders)
-        .values({
-          orderCode: `TEMP-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
-          customerName,
-          customerPhone,
-          customerAddress,
-          subtotal: calculatedSubtotal.toFixed(2),
-          deliveryCharge: deliveryChargeNum.toFixed(2),
-          totalAmount: totalAmountNum.toFixed(2),
-          paymentMethod,
-          paymentStatus: "PENDING",
-          status: "PENDING_WHATSAPP",
-        })
-        .returning();
+    const promoIds = activePromos.map((p) => p.id);
 
-      // Atomic orderCode generated from the row's own serial ID (prevents race condition)
-      const finalOrderCode = `SSM-${newOrder.id.toString().padStart(4, "0")}`;
+    const allTargets =
+      promoIds.length > 0
+        ? await db
+            .select()
+            .from(promotionTargets)
+            .where(inArray(promotionTargets.promotionId, promoIds))
+        : [];
 
-      const [updatedOrder] = await tx
-        .update(orders)
-        .set({ orderCode: finalOrderCode })
-        .where(eq(orders.id, newOrder.id))
-        .returning();
+    const allComboComponents =
+      promoIds.length > 0
+        ? await db
+            .select()
+            .from(promotionComboComponents)
+            .where(inArray(promotionComboComponents.promotionId, promoIds))
+        : [];
 
-      // Insert snapshot order items
-      const itemsToInsert = orderItemSnapshots.map((snap) => ({
-        orderId: updatedOrder.id,
-        productVariantId: snap.productVariantId,
-        productNameSnapshot: snap.productName,
-        variantUnitSnapshot: snap.variantUnit,
-        unitPriceSnapshot: snap.unitPrice,
-        quantity: snap.quantity,
-        lineTotal: snap.lineTotal,
-      }));
+    const targetsByPromo = new Map<number, typeof allTargets>();
+    for (const t of allTargets) {
+      const list = targetsByPromo.get(t.promotionId) || [];
+      list.push(t);
+      targetsByPromo.set(t.promotionId, list);
+    }
 
-      const inserted = await tx
-        .insert(orderItems)
-        .values(itemsToInsert)
-        .returning();
+    const componentsByPromo = new Map<number, typeof allComboComponents>();
+    for (const c of allComboComponents) {
+      const list = componentsByPromo.get(c.promotionId) || [];
+      list.push(c);
+      componentsByPromo.set(c.promotionId, list);
+    }
 
-      // Record first status history entry
-      await tx.insert(orderStatusHistory).values({
-        orderId: updatedOrder.id,
-        status: "PENDING_WHATSAPP",
-        note: "Order placed via website checkout",
-      });
+    const fullPromos = activePromos.map((p) => ({
+      ...p,
+      targets: targetsByPromo.get(p.id) || [],
+      comboComponents: componentsByPromo.get(p.id) || [],
+    }));
 
-      return { createdOrder: updatedOrder, insertedItems: inserted };
-    });
+    // 5. Authoritative promotion calculation
+    const calcResult = calculateCartPromotions(
+      cartVariantItems,
+      fullPromos,
+      new Date()
+    );
 
-    // 5. Generate WhatsApp deep link
-    const whatsappPayload = {
-      orderCode: createdOrder.orderCode,
-      customerName: createdOrder.customerName,
-      customerPhone: createdOrder.customerPhone,
-      customerAddress: createdOrder.customerAddress,
-      subtotal: createdOrder.subtotal,
-      deliveryCharge: createdOrder.deliveryCharge,
-      totalAmount: createdOrder.totalAmount,
-      paymentMethod: createdOrder.paymentMethod,
-      items: insertedItems.map((item) => ({
-        productName: item.productNameSnapshot,
-        variantUnit: item.variantUnitSnapshot,
-        unitPrice: item.unitPriceSnapshot,
-        quantity: item.quantity,
-        lineTotal: item.lineTotal,
-      })),
-    };
+    const grossSubtotal = calcResult.grossSubtotal;
+    const totalDiscount = calcResult.totalDiscount;
+    const netSubtotal = calcResult.netSubtotal;
+    const cartGrossSubtotal = calcResult.cartGrossSubtotal;
 
-    let whatsappResult;
     try {
-      whatsappResult = sendOrderNotification(whatsappPayload);
-    } catch (err: any) {
-      request.log.error(err);
-      // Even if WhatsApp formatting fails, return order data so customer is not stranded
-      whatsappResult = {
-        whatsappUrl: "",
-        whatsappMessage: "",
-        error: err.message,
-      };
-    }
+      // 6. Atomic transaction: lookup zone, check min order / free delivery on cart merchandise subtotal, create order & items
+      const { createdOrder, insertedItems } = await db.transaction(async (tx) => {
+        // Step A: Server-side lookup of deliveryZoneId
+        const [zone] = await tx
+          .select()
+          .from(deliveryZones)
+          .where(eq(deliveryZones.id, deliveryZoneId));
 
-    return reply.status(201).send({
-      success: true,
-      data: {
-        order: createdOrder,
-        items: insertedItems,
-        whatsappUrl: whatsappResult.whatsappUrl,
-        whatsappMessage: whatsappResult.whatsappMessage,
-      },
-    });
+        if (!zone || !zone.isActive) {
+          throw new OrderValidationError(
+            "Selected delivery area is unavailable. Please choose a valid delivery area."
+          );
+        }
+
+        // Step B: Minimum-Order Check on customer requested merchandise subtotal (Phase 4 Preserved)
+        // Does NOT use post-discount or inflated physical quantity to alter delivery eligibility
+        const minOrder = parseFloat(zone.minOrderAmount || "0");
+        if (cartGrossSubtotal < minOrder) {
+          const shortfall = (minOrder - cartGrossSubtotal).toFixed(0);
+          throw new OrderValidationError(
+            `Minimum order for ${zone.name} is ₹${minOrder.toFixed(0)}, add ₹${shortfall} more to place order.`
+          );
+        }
+
+        // Step C: Free Delivery Threshold Check on customer requested merchandise subtotal (Phase 4 Preserved)
+        let deliveryChargeNum = parseFloat(zone.deliveryCharge || "0");
+        if (
+          zone.freeDeliveryAboveAmount !== null &&
+          zone.freeDeliveryAboveAmount !== undefined
+        ) {
+          const freeThreshold = parseFloat(zone.freeDeliveryAboveAmount);
+          if (cartGrossSubtotal >= freeThreshold) {
+            deliveryChargeNum = 0.0;
+          }
+        }
+
+        const totalAmountNum = netSubtotal + deliveryChargeNum;
+
+        // Step D: Insert order with initial placeholder code
+        const [newOrder] = await tx
+          .insert(orders)
+          .values({
+            orderCode: `TEMP-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+            customerName,
+            customerPhone,
+            customerAddress,
+            deliveryZoneId: zone.id,
+            subtotal: grossSubtotal.toFixed(2),
+            totalDiscount: totalDiscount.toFixed(2),
+            deliveryCharge: deliveryChargeNum.toFixed(2),
+            totalAmount: totalAmountNum.toFixed(2),
+            appliedPromotionsSummary: calcResult.appliedPromotionsSummary,
+            paymentMethod,
+            paymentStatus: "PENDING",
+            status: "PENDING_WHATSAPP",
+          })
+          .returning();
+
+        // Atomic orderCode generated from the row's own serial ID
+        const finalOrderCode = `SSM-${newOrder.id.toString().padStart(4, "0")}`;
+
+        const [updatedOrder] = await tx
+          .update(orders)
+          .set({ orderCode: finalOrderCode })
+          .where(eq(orders.id, newOrder.id))
+          .returning();
+
+        // Step E: Insert split snapshot order items
+        const itemsToInsert = calcResult.splitAllocations.map((alloc) => ({
+          orderId: updatedOrder.id,
+          productVariantId: alloc.productVariantId,
+          promotionId: alloc.promotionId,
+          promotionTypeSnapshot: alloc.promotionTypeSnapshot,
+          discountAmount: alloc.discountAmount.toFixed(2),
+          productNameSnapshot: alloc.productName,
+          variantUnitSnapshot: alloc.variantUnit,
+          unitPriceSnapshot: alloc.sellingPrice.toFixed(2),
+          quantity: alloc.quantity, // TOTAL PHYSICAL UNITS to fulfill
+          paidQuantity: alloc.paidQuantity,
+          freeQuantity: alloc.freeQuantity,
+          lineTotal: alloc.lineTotal.toFixed(2),
+        }));
+
+        const inserted = await tx
+          .insert(orderItems)
+          .values(itemsToInsert)
+          .returning();
+
+        // Record first status history entry
+        await tx.insert(orderStatusHistory).values({
+          orderId: updatedOrder.id,
+          status: "PENDING_WHATSAPP",
+          note: `Order placed via website checkout (${zone.name})`,
+        });
+
+        return { createdOrder: updatedOrder, insertedItems: inserted };
+      });
+
+      // 7. Generate WhatsApp deep link with frozen order snapshot
+      const whatsappPayload = {
+        orderCode: createdOrder.orderCode,
+        customerName: createdOrder.customerName,
+        customerPhone: createdOrder.customerPhone,
+        customerAddress: createdOrder.customerAddress,
+        subtotal: createdOrder.subtotal,
+        totalDiscount: createdOrder.totalDiscount,
+        deliveryCharge: createdOrder.deliveryCharge,
+        totalAmount: createdOrder.totalAmount,
+        paymentMethod: createdOrder.paymentMethod,
+        appliedPromotions: createdOrder.appliedPromotionsSummary,
+        items: insertedItems.map((item) => ({
+          productName: item.productNameSnapshot,
+          variantUnit: item.variantUnitSnapshot,
+          unitPrice: item.unitPriceSnapshot,
+          quantity: item.quantity,
+          paidQuantity: item.paidQuantity,
+          freeQuantity: item.freeQuantity,
+          promotionType: item.promotionTypeSnapshot,
+          lineTotal: item.lineTotal,
+        })),
+      };
+
+      let whatsappResult;
+      try {
+        whatsappResult = await sendOrderNotification(whatsappPayload);
+      } catch (err: any) {
+        request.log.error(err);
+        whatsappResult = {
+          whatsappUrl: "",
+          whatsappMessage: "",
+          error: err.message,
+        };
+      }
+
+      return reply.status(201).send({
+        success: true,
+        data: {
+          order: createdOrder,
+          items: insertedItems,
+          whatsappUrl: whatsappResult.whatsappUrl,
+          whatsappMessage: whatsappResult.whatsappMessage,
+        },
+      });
+    } catch (err: any) {
+      if (err instanceof OrderValidationError) {
+        return reply.status(400).send({
+          success: false,
+          message: err.message,
+        });
+      }
+      request.log.error(err);
+      return reply.status(500).send({
+        success: false,
+        message: "Failed to place order. Please try again.",
+      });
+    }
   });
 
   // 2. Get order by orderCode (for public tracking)
